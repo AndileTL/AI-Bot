@@ -152,7 +152,7 @@ export const FileTree = memo(
                   key={fileOrFolder.id}
                   selected={selectedFile === fileOrFolder.fullPath}
                   file={fileOrFolder}
-                  unsavedChanges={unsavedFiles?.has(fileOrFolder.fullPath)}
+                  unsavedChanges={unsavedFiles instanceof Set && unsavedFiles.has(fileOrFolder.fullPath)}
                   fileHistory={fileHistory}
                   onCopyPath={() => {
                     onCopyPath(fileOrFolder);
@@ -402,6 +402,126 @@ function FileContextMenu({
     }
   };
 
+  // Handler for locking a file with full lock
+  const handleLockFile = () => {
+    try {
+      if (isFolder) {
+        return;
+      }
+
+      const success = workbenchStore.lockFile(fullPath, 'full');
+
+      if (success) {
+        toast.success(`File locked successfully`);
+      } else {
+        toast.error(`Failed to lock file`);
+      }
+    } catch (error) {
+      toast.error(`Error locking file`);
+      logger.error(error);
+    }
+  };
+
+  // Handler for locking a file with scoped lock
+  const handleScopedLockFile = () => {
+    try {
+      if (isFolder) {
+        return;
+      }
+
+      const success = workbenchStore.lockFile(fullPath, 'scoped');
+
+      if (success) {
+        toast.success(`File locked (scoped) successfully`);
+      } else {
+        toast.error(`Failed to lock file`);
+      }
+    } catch (error) {
+      toast.error(`Error locking file`);
+      logger.error(error);
+    }
+  };
+
+  // Handler for unlocking a file
+  const handleUnlockFile = () => {
+    try {
+      if (isFolder) {
+        return;
+      }
+
+      const success = workbenchStore.unlockFile(fullPath);
+
+      if (success) {
+        toast.success(`File unlocked successfully`);
+      } else {
+        toast.error(`Failed to unlock file`);
+      }
+    } catch (error) {
+      toast.error(`Error unlocking file`);
+      logger.error(error);
+    }
+  };
+
+  // Handler for locking a folder with full lock
+  const handleLockFolder = () => {
+    try {
+      if (!isFolder) {
+        return;
+      }
+
+      const success = workbenchStore.lockFolder(fullPath, 'full');
+
+      if (success) {
+        toast.success(`Folder locked successfully`);
+      } else {
+        toast.error(`Failed to lock folder`);
+      }
+    } catch (error) {
+      toast.error(`Error locking folder`);
+      logger.error(error);
+    }
+  };
+
+  // Handler for locking a folder with scoped lock
+  const handleScopedLockFolder = () => {
+    try {
+      if (!isFolder) {
+        return;
+      }
+
+      const success = workbenchStore.lockFolder(fullPath, 'scoped');
+
+      if (success) {
+        toast.success(`Folder locked (scoped) successfully`);
+      } else {
+        toast.error(`Failed to lock folder`);
+      }
+    } catch (error) {
+      toast.error(`Error locking folder`);
+      logger.error(error);
+    }
+  };
+
+  // Handler for unlocking a folder
+  const handleUnlockFolder = () => {
+    try {
+      if (!isFolder) {
+        return;
+      }
+
+      const success = workbenchStore.unlockFolder(fullPath);
+
+      if (success) {
+        toast.success(`Folder unlocked successfully`);
+      } else {
+        toast.error(`Failed to unlock folder`);
+      }
+    } catch (error) {
+      toast.error(`Error unlocking folder`);
+      logger.error(error);
+    }
+  };
+
   return (
     <>
       <ContextMenu.Root>
@@ -441,6 +561,52 @@ function FileContextMenu({
               <ContextMenuItem onSelect={onCopyPath}>Copy path</ContextMenuItem>
               <ContextMenuItem onSelect={onCopyRelativePath}>Copy relative path</ContextMenuItem>
             </ContextMenu.Group>
+            {/* Add lock/unlock options for files and folders */}
+            <ContextMenu.Group className="p-1 border-t-px border-solid border-bolt-elements-borderColor">
+              {!isFolder ? (
+                <>
+                  <ContextMenuItem onSelect={handleLockFile}>
+                    <div className="flex items-center gap-2">
+                      <div className="i-ph:lock-simple" />
+                      Lock File (Full)
+                    </div>
+                  </ContextMenuItem>
+                  <ContextMenuItem onSelect={handleScopedLockFile}>
+                    <div className="flex items-center gap-2">
+                      <div className="i-ph:lock-simple-open" />
+                      Lock File (Scoped)
+                    </div>
+                  </ContextMenuItem>
+                  <ContextMenuItem onSelect={handleUnlockFile}>
+                    <div className="flex items-center gap-2">
+                      <div className="i-ph:lock-key-open" />
+                      Unlock File
+                    </div>
+                  </ContextMenuItem>
+                </>
+              ) : (
+                <>
+                  <ContextMenuItem onSelect={handleLockFolder}>
+                    <div className="flex items-center gap-2">
+                      <div className="i-ph:lock-simple" />
+                      Lock Folder (Full)
+                    </div>
+                  </ContextMenuItem>
+                  <ContextMenuItem onSelect={handleScopedLockFolder}>
+                    <div className="flex items-center gap-2">
+                      <div className="i-ph:lock-simple-open" />
+                      Lock Folder (Scoped)
+                    </div>
+                  </ContextMenuItem>
+                  <ContextMenuItem onSelect={handleUnlockFolder}>
+                    <div className="flex items-center gap-2">
+                      <div className="i-ph:lock-key-open" />
+                      Unlock Folder
+                    </div>
+                  </ContextMenuItem>
+                </>
+              )}
+            </ContextMenu.Group>
             {/* Add delete option in a new group */}
             <ContextMenu.Group className="p-1 border-t-px border-solid border-bolt-elements-borderColor">
               <ContextMenuItem onSelect={handleDelete}>
@@ -474,6 +640,9 @@ function FileContextMenu({
 }
 
 function Folder({ folder, collapsed, selected = false, onCopyPath, onCopyRelativePath, onClick }: FolderProps) {
+  // Check if the folder is locked
+  const { locked, lockMode } = workbenchStore.isFolderLocked(folder.fullPath);
+
   return (
     <FileContextMenu onCopyPath={onCopyPath} onCopyRelativePath={onCopyRelativePath} fullPath={folder.fullPath}>
       <NodeButton
@@ -489,7 +658,20 @@ function Folder({ folder, collapsed, selected = false, onCopyPath, onCopyRelativ
         })}
         onClick={onClick}
       >
-        {folder.name}
+        <div className="flex items-center w-full">
+          <div className="flex-1 truncate pr-2">{folder.name}</div>
+          {locked && (
+            <span
+              className={classNames(
+                'shrink-0',
+                lockMode === 'full'
+                  ? 'i-ph:lock-simple scale-80 text-red-500'
+                  : 'i-ph:lock-simple-open scale-80 text-yellow-500',
+              )}
+              title={lockMode === 'full' ? 'Folder is fully locked' : 'Folder has scoped locking'}
+            />
+          )}
+        </div>
       </NodeButton>
     </FileContextMenu>
   );
@@ -515,6 +697,9 @@ function File({
   fileHistory = {},
 }: FileProps) {
   const { depth, name, fullPath } = file;
+
+  // Check if the file is locked
+  const { locked, lockMode } = workbenchStore.isFileLocked(fullPath);
 
   const fileModifications = fileHistory[fullPath];
 
@@ -581,6 +766,17 @@ function File({
                 {additions > 0 && <span className="text-green-500">+{additions}</span>}
                 {deletions > 0 && <span className="text-red-500">-{deletions}</span>}
               </div>
+            )}
+            {locked && (
+              <span
+                className={classNames(
+                  'shrink-0',
+                  lockMode === 'full'
+                    ? 'i-ph:lock-simple scale-80 text-red-500'
+                    : 'i-ph:lock-simple-open scale-80 text-yellow-500',
+                )}
+                title={lockMode === 'full' ? 'File is fully locked' : 'File has scoped locking'}
+              />
             )}
             {unsavedChanges && <span className="i-ph:circle-fill scale-68 shrink-0 text-orange-500" />}
           </div>

@@ -8,6 +8,17 @@ import { WORK_DIR } from '~/utils/constants';
 import { computeFileModifications } from '~/utils/diff';
 import { createScopedLogger } from '~/utils/logger';
 import { unreachable } from '~/utils/unreachable';
+import {
+  addLockedFile,
+  removeLockedFile,
+  addLockedFolder,
+  removeLockedFolder,
+  getLockedFilesForChat,
+  getLockedFoldersForChat,
+  migrateLegacyLocks,
+  type LockMode,
+} from '~/lib/persistence/lockedFiles';
+import { getCurrentChatId } from '~/utils/fileLocks';
 
 const logger = createScopedLogger('FilesStore');
 
@@ -17,10 +28,16 @@ export interface File {
   type: 'file';
   content: string;
   isBinary: boolean;
+  locked?: boolean;
+  lockMode?: 'full' | 'scoped' | null;
+  lockedByFolder?: string; // Path of the folder that locked this file
 }
 
 export interface Folder {
-  type: 'folder';
+  type: 'folder' | 'directory'; // Support both 'folder' and 'directory' for backward compatibility
+  locked?: boolean;
+  lockMode?: 'full' | 'scoped' | null;
+  lockedByFolder?: string; // Path of the folder that locked this folder (for nested folders)
 }
 
 type Dirent = File | Folder;
@@ -76,6 +93,9 @@ export class FilesStore {
       logger.error('Failed to load deleted paths from localStorage', error);
     }
 
+    // Load locked files from localStorage
+    this.#loadLockedFiles();
+
     if (import.meta.hot) {
       // Persist our state across hot reloads
       import.meta.hot.data.files = this.files;
@@ -83,17 +103,455 @@ export class FilesStore {
       import.meta.hot.data.deletedPaths = this.#deletedPaths;
     }
 
+    // Listen for URL changes to detect chat ID changes
+    if (typeof window !== 'undefined') {
+      let lastChatId = getCurrentChatId();
+
+      // Use MutationObserver to detect URL changes (for SPA navigation)
+      const observer = new MutationObserver(() => {
+        const currentChatId = getCurrentChatId();
+
+        if (currentChatId !== lastChatId) {
+          logger.info(`Chat ID changed from ${lastChatId} to ${currentChatId}, reloading locks`);
+          lastChatId = currentChatId;
+          this.#loadLockedFiles(currentChatId);
+        }
+      });
+
+      observer.observe(document, { subtree: true, childList: true });
+    }
+
     this.#init();
+  }
+
+  /**
+   * Load locked files and folders from localStorage and update the file objects
+   * @param chatId Optional chat ID to load locks for (defaults to current chat)
+   */
+  #loadLockedFiles(chatId?: string) {
+    try {
+      const currentChatId = chatId || getCurrentChatId();
+
+      // Migrate any legacy locks to the current chat
+      migrateLegacyLocks(currentChatId);
+
+      // Get file locks for the current chat
+      const lockedFiles = getLockedFilesForChat(currentChatId);
+
+      // Get folder locks for the current chat
+      const lockedFolders = getLockedFoldersForChat(currentChatId);
+
+      if (lockedFiles.length === 0 && lockedFolders.length === 0) {
+        logger.info(`No locked items found for chat ID: ${currentChatId}`);
+        return;
+      }
+
+      logger.info(
+        `Found ${lockedFiles.length} locked files and ${lockedFolders.length} locked folders for chat ID: ${currentChatId}`,
+      );
+
+      const currentFiles = this.files.get();
+      const updates: FileMap = {};
+
+      // Process file locks
+      for (const lockedFile of lockedFiles) {
+        logger.info(`Applying lock to file: ${lockedFile.path} (mode: ${lockedFile.lockMode})`);
+
+        const file = currentFiles[lockedFile.path];
+
+        if (file?.type === 'file') {
+          updates[lockedFile.path] = {
+            ...file,
+            locked: true,
+            lockMode: lockedFile.lockMode,
+          };
+        } else {
+          logger.warn(`Locked file not found in current files: ${lockedFile.path}`);
+        }
+      }
+
+      // Process folder locks
+      for (const lockedFolder of lockedFolders) {
+        logger.info(`Applying lock to folder: ${lockedFolder.path} (mode: ${lockedFolder.lockMode})`);
+
+        const folder = currentFiles[lockedFolder.path];
+
+        if (folder?.type === 'directory') {
+          updates[lockedFolder.path] = {
+            ...folder,
+            locked: true,
+            lockMode: lockedFolder.lockMode,
+          };
+
+          // Also mark all files within the folder as locked
+          this.#applyLockToFolderContents(currentFiles, updates, lockedFolder.path, lockedFolder.lockMode);
+        } else {
+          logger.warn(`Locked folder not found in current files: ${lockedFolder.path}`);
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        logger.info(`Updating ${Object.keys(updates).length} files with lock state`);
+        this.files.set({ ...currentFiles, ...updates });
+      }
+    } catch (error) {
+      logger.error('Failed to load locked files from localStorage', error);
+    }
+  }
+
+  /**
+   * Apply a lock to all files within a folder
+   * @param currentFiles Current file map
+   * @param updates Updates to apply
+   * @param folderPath Path of the folder to lock
+   * @param lockMode Lock mode to apply
+   */
+  #applyLockToFolderContents(currentFiles: FileMap, updates: FileMap, folderPath: string, lockMode: LockMode) {
+    const folderPrefix = folderPath.endsWith('/') ? folderPath : `${folderPath}/`;
+
+    // Find all files that are within this folder
+    Object.entries(currentFiles).forEach(([path, file]) => {
+      if (path.startsWith(folderPrefix) && file) {
+        if (file.type === 'file') {
+          updates[path] = {
+            ...file,
+            locked: true,
+            lockMode,
+
+            // Add a property to indicate this is locked by a parent folder
+            lockedByFolder: folderPath,
+          };
+        } else if (file.type === 'folder' || file.type === 'directory') {
+          updates[path] = {
+            ...file,
+            locked: true,
+            lockMode,
+
+            // Add a property to indicate this is locked by a parent folder
+            lockedByFolder: folderPath,
+          };
+        }
+      }
+    });
+  }
+
+  /**
+   * Lock a file
+   * @param filePath Path to the file to lock
+   * @param lockMode Type of lock to apply
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns True if the file was successfully locked
+   */
+  lockFile(filePath: string, lockMode: LockMode, chatId?: string) {
+    const file = this.getFile(filePath);
+    const currentChatId = chatId || getCurrentChatId();
+
+    if (!file) {
+      logger.error(`Cannot lock non-existent file: ${filePath}`);
+      return false;
+    }
+
+    // Update the file in the store
+    this.files.setKey(filePath, {
+      ...file,
+      locked: true,
+      lockMode,
+    });
+
+    // Persist to localStorage with chat ID
+    addLockedFile(currentChatId, filePath, lockMode);
+
+    logger.info(`File locked: ${filePath} (mode: ${lockMode}) for chat: ${currentChatId}`);
+
+    return true;
+  }
+
+  /**
+   * Lock a folder and all its contents
+   * @param folderPath Path to the folder to lock
+   * @param lockMode Type of lock to apply
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns True if the folder was successfully locked
+   */
+  lockFolder(folderPath: string, lockMode: LockMode, chatId?: string) {
+    const folder = this.getFileOrFolder(folderPath);
+    const currentFiles = this.files.get();
+    const currentChatId = chatId || getCurrentChatId();
+
+    if (!folder || (folder.type !== 'folder' && folder.type !== 'directory')) {
+      logger.error(`Cannot lock non-existent folder: ${folderPath}`);
+      return false;
+    }
+
+    const updates: FileMap = {};
+
+    // Update the folder in the store
+    updates[folderPath] = {
+      type: folder.type,
+      locked: true,
+      lockMode,
+    };
+
+    // Apply lock to all files within the folder
+    this.#applyLockToFolderContents(currentFiles, updates, folderPath, lockMode);
+
+    // Update the store with all changes
+    this.files.set({ ...currentFiles, ...updates });
+
+    // Persist to localStorage with chat ID
+    addLockedFolder(currentChatId, folderPath, lockMode);
+
+    logger.info(`Folder locked: ${folderPath} (mode: ${lockMode}) for chat: ${currentChatId}`);
+
+    return true;
+  }
+
+  /**
+   * Unlock a file
+   * @param filePath Path to the file to unlock
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns True if the file was successfully unlocked
+   */
+  unlockFile(filePath: string, chatId?: string) {
+    const file = this.getFile(filePath);
+    const currentChatId = chatId || getCurrentChatId();
+
+    if (!file) {
+      logger.error(`Cannot unlock non-existent file: ${filePath}`);
+      return false;
+    }
+
+    // Update the file in the store
+    this.files.setKey(filePath, {
+      ...file,
+      locked: false,
+      lockMode: null,
+      lockedByFolder: undefined, // Clear the parent folder lock reference if it exists
+    });
+
+    // Remove from localStorage with chat ID
+    removeLockedFile(currentChatId, filePath);
+
+    logger.info(`File unlocked: ${filePath} for chat: ${currentChatId}`);
+
+    return true;
+  }
+
+  /**
+   * Unlock a folder and all its contents
+   * @param folderPath Path to the folder to unlock
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns True if the folder was successfully unlocked
+   */
+  unlockFolder(folderPath: string, chatId?: string) {
+    const folder = this.getFileOrFolder(folderPath);
+    const currentFiles = this.files.get();
+    const currentChatId = chatId || getCurrentChatId();
+
+    if (!folder || (folder.type !== 'folder' && folder.type !== 'directory')) {
+      logger.error(`Cannot unlock non-existent folder: ${folderPath}`);
+      return false;
+    }
+
+    const updates: FileMap = {};
+
+    // Update the folder in the store
+    updates[folderPath] = {
+      type: folder.type,
+      locked: false,
+      lockMode: null,
+    };
+
+    // Find all files that are within this folder and unlock them
+    const folderPrefix = folderPath.endsWith('/') ? folderPath : `${folderPath}/`;
+
+    Object.entries(currentFiles).forEach(([path, file]) => {
+      if (path.startsWith(folderPrefix) && file) {
+        if (file.type === 'file' && file.lockedByFolder === folderPath) {
+          updates[path] = {
+            ...file,
+            locked: false,
+            lockMode: null,
+            lockedByFolder: undefined,
+          };
+        } else if ((file.type === 'folder' || file.type === 'directory') && file.lockedByFolder === folderPath) {
+          updates[path] = {
+            type: file.type,
+            locked: false,
+            lockMode: null,
+            lockedByFolder: undefined,
+          };
+        }
+      }
+    });
+
+    // Update the store with all changes
+    this.files.set({ ...currentFiles, ...updates });
+
+    // Remove from localStorage with chat ID
+    removeLockedFolder(currentChatId, folderPath);
+
+    logger.info(`Folder unlocked: ${folderPath} for chat: ${currentChatId}`);
+
+    return true;
+  }
+
+  /**
+   * Check if a file is locked
+   * @param filePath Path to the file to check
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns Object with locked status, lock mode, and what caused the lock
+   */
+  isFileLocked(filePath: string, chatId?: string): { locked: boolean; lockMode?: LockMode; lockedBy?: string } {
+    const file = this.getFile(filePath);
+    const currentChatId = chatId || getCurrentChatId();
+
+    if (!file) {
+      return { locked: false };
+    }
+
+    // First check the in-memory state
+    if (file.locked) {
+      // If the file is locked by a folder, include that information
+      if (file.lockedByFolder) {
+        return {
+          locked: true,
+          lockMode: file.lockMode as LockMode | undefined,
+          lockedBy: file.lockedByFolder as string,
+        };
+      }
+
+      return {
+        locked: true,
+        lockMode: file.lockMode as LockMode | undefined,
+        lockedBy: filePath,
+      };
+    }
+
+    // Then check localStorage for direct file locks
+    const lockedFiles = getLockedFilesForChat(currentChatId);
+    const lockedFile = lockedFiles.find((item) => item.path === filePath);
+
+    if (lockedFile) {
+      // Update the in-memory state to match localStorage
+      this.files.setKey(filePath, {
+        ...file,
+        locked: true,
+        lockMode: lockedFile.lockMode,
+      });
+
+      return { locked: true, lockMode: lockedFile.lockMode, lockedBy: filePath };
+    }
+
+    // Finally, check if the file is in a locked folder
+    const folderLockResult = this.isFileInLockedFolder(filePath, currentChatId);
+
+    if (folderLockResult.locked) {
+      // Update the in-memory state to reflect the folder lock
+      this.files.setKey(filePath, {
+        ...file,
+        locked: true,
+        lockMode: folderLockResult.lockMode,
+        lockedByFolder: folderLockResult.lockedBy,
+      });
+
+      return folderLockResult;
+    }
+
+    return { locked: false };
+  }
+
+  /**
+   * Check if a file is within a locked folder
+   * @param filePath Path to the file to check
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns Object with locked status, lock mode, and the folder that caused the lock
+   */
+  isFileInLockedFolder(filePath: string, chatId?: string): { locked: boolean; lockMode?: LockMode; lockedBy?: string } {
+    const currentChatId = chatId || getCurrentChatId();
+
+    // Get all locked folders
+    const lockedFolders = getLockedFoldersForChat(currentChatId);
+
+    // Check if the file is in any of the locked folders
+    for (const folder of lockedFolders) {
+      const folderPrefix = folder.path.endsWith('/') ? folder.path : `${folder.path}/`;
+
+      if (filePath.startsWith(folderPrefix) || filePath === folder.path) {
+        return {
+          locked: true,
+          lockMode: folder.lockMode,
+          lockedBy: folder.path,
+        };
+      }
+    }
+
+    return { locked: false };
+  }
+
+  /**
+   * Check if a folder is locked
+   * @param folderPath Path to the folder to check
+   * @param chatId Optional chat ID (defaults to current chat)
+   * @returns Object with locked status and lock mode
+   */
+  isFolderLocked(folderPath: string, chatId?: string): { locked: boolean; lockMode?: LockMode; lockedBy?: string } {
+    const folder = this.getFileOrFolder(folderPath);
+    const currentChatId = chatId || getCurrentChatId();
+
+    if (!folder || (folder.type !== 'folder' && folder.type !== 'directory')) {
+      return { locked: false };
+    }
+
+    // First check the in-memory state
+    if (folder.locked) {
+      return {
+        locked: true,
+        lockMode: folder.lockMode as LockMode | undefined,
+        lockedBy: folderPath,
+      };
+    }
+
+    // Then check localStorage for this specific chat
+    const lockedFolders = getLockedFoldersForChat(currentChatId);
+    const lockedFolder = lockedFolders.find((item) => item.path === folderPath);
+
+    if (lockedFolder) {
+      // Update the in-memory state to match localStorage
+      this.files.setKey(folderPath, {
+        type: folder.type,
+        locked: true,
+        lockMode: lockedFolder.lockMode,
+      });
+
+      return { locked: true, lockMode: lockedFolder.lockMode, lockedBy: folderPath };
+    }
+
+    return { locked: false };
   }
 
   getFile(filePath: string) {
     const dirent = this.files.get()[filePath];
 
-    if (dirent?.type !== 'file') {
+    if (!dirent) {
+      return undefined;
+    }
+
+    // For backward compatibility, only return file type dirents
+    if (dirent.type !== 'file') {
       return undefined;
     }
 
     return dirent;
+  }
+
+  /**
+   * Get any file or folder from the file system
+   * @param path Path to the file or folder
+   * @returns The file or folder, or undefined if it doesn't exist
+   */
+  getFileOrFolder(path: string) {
+    return this.files.get()[path];
   }
 
   getFileModifications() {
@@ -149,8 +607,19 @@ export class FilesStore {
         this.#modifiedFiles.set(filePath, oldContent);
       }
 
+      // Get the current lock state before updating
+      const currentFile = this.files.get()[filePath];
+      const locked = currentFile?.type === 'file' ? currentFile.locked : false;
+      const lockMode = currentFile?.type === 'file' ? currentFile.lockMode : null;
+
       // we immediately update the file and don't rely on the `change` event coming from the watcher
-      this.files.setKey(filePath, { type: 'file', content, isBinary: false });
+      this.files.setKey(filePath, {
+        type: 'file',
+        content,
+        isBinary: false,
+        locked,
+        lockMode,
+      });
 
       logger.info('File updated');
     } catch (error) {
@@ -166,10 +635,35 @@ export class FilesStore {
     // Clean up any files that were previously deleted
     this.#cleanupDeletedFiles();
 
+    // Set up file watcher
     webcontainer.internal.watchPaths(
       { include: [`${WORK_DIR}/**`], exclude: ['**/node_modules', '.git'], includeContent: true },
       bufferWatchEvents(100, this.#processEventBuffer.bind(this)),
     );
+
+    // Get the current chat ID
+    const currentChatId = getCurrentChatId();
+
+    // Migrate any legacy locks to the current chat
+    migrateLegacyLocks(currentChatId);
+
+    // Load locked files immediately for the current chat
+    this.#loadLockedFiles(currentChatId);
+
+    /*
+     * Also set up a timer to load locked files again after a delay
+     * This ensures that locks are applied even if files are loaded asynchronously
+     */
+    setTimeout(() => {
+      this.#loadLockedFiles(currentChatId);
+      logger.info(`Reapplied locked files for chat ID: ${currentChatId}`);
+    }, 2000);
+
+    // Set up a periodic check to ensure locks remain applied
+    setInterval(() => {
+      const latestChatId = getCurrentChatId();
+      this.#loadLockedFiles(latestChatId);
+    }, 10000);
   }
 
   /**
@@ -302,7 +796,17 @@ export class FilesStore {
             content = existingFile.content;
           }
 
-          this.files.setKey(sanitizedPath, { type: 'file', content, isBinary });
+          // Preserve lock state if the file already exists
+          const locked = existingFile?.type === 'file' ? existingFile.locked : false;
+          const lockMode = existingFile?.type === 'file' ? existingFile.lockMode : null;
+
+          this.files.setKey(sanitizedPath, {
+            type: 'file',
+            content,
+            isBinary,
+            locked,
+            lockMode,
+          });
           break;
         }
         case 'remove_file': {
@@ -353,14 +857,26 @@ export class FilesStore {
         await webcontainer.fs.writeFile(relativePath, Buffer.from(content));
 
         const base64Content = Buffer.from(content).toString('base64');
-        this.files.setKey(filePath, { type: 'file', content: base64Content, isBinary: true });
+        this.files.setKey(filePath, {
+          type: 'file',
+          content: base64Content,
+          isBinary: true,
+          locked: false,
+          lockMode: null,
+        });
 
         this.#modifiedFiles.set(filePath, base64Content);
       } else {
         const contentToWrite = (content as string).length === 0 ? ' ' : content;
         await webcontainer.fs.writeFile(relativePath, contentToWrite);
 
-        this.files.setKey(filePath, { type: 'file', content: content as string, isBinary: false });
+        this.files.setKey(filePath, {
+          type: 'file',
+          content: content as string,
+          isBinary: false,
+          locked: false,
+          lockMode: null,
+        });
 
         this.#modifiedFiles.set(filePath, content as string);
       }
